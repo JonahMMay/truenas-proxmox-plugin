@@ -1,3 +1,223 @@
+truenas-proxmox-plugin (2.1.23~beta3) unstable; urgency=medium
+
+  * Bundle of fixes across the plugin runtime, the broker, install.sh,
+    and packaging. Every item below cites the GitHub issue it closes
+    or contributes to.
+
+  * Plugin runtime (TrueNASPlugin.pm):
+
+    - #77 (WarlockSyno): _api_bulk_call passed 4 args to _api_call_mutate,
+      whose 3-arg Perl signature dies before reaching TrueNAS. Trailing
+      "die on transport unavailable" fallback was aspirational --
+      _api_call_mutate already dies from its own broker path -- so
+      dropped the 4th argument. Dormant in shipping releases (dead
+      code path) but no longer a trap the moment anything wires the
+      bulk helpers in.
+
+    - #76 (WarlockSyno): _wait_for_job_completion called TrueNAS as
+      _api_call($scfg, 'core.call', ['core.get_jobs', ...]). TN's
+      middleware has no 'core.call' method (JSON-RPC -32601 verified
+      live against TN 25.10.2.1), so every job-completion poll
+      returned an eval error and the plugin reported success as
+      failure. Rewrote to call 'core.get_jobs' directly with the
+      standard .query filter shape [[ ["id", "=", int($job_id)] ]].
+      Same "dormant in current release paths, but a trap for future
+      wiring" impact as #77.
+
+    - #90 (joaquinv98, root-cause traced by WarlockSyno): plugin
+      hardcoded allow_any_host => JSON::PP::true on the NVMe subsystem
+      in six sites. On TN 25.10.x with a populated allowed_hosts,
+      attr_allow_any_host=1 is mutually exclusive with the allow-list
+      at the kernel level; nvmet's config writer aborts the whole
+      render, port-subsys/port/namespace symlinks never get written,
+      the TCP listener never opens, and namespace deletions never
+      propagate to the kernel (zvols stay EBUSY, feeds #88 half 2).
+      Introduced `tn_nvme_allow_any_host` config knob (bool, optional,
+      default TRUE) plus helper `_nvme_allow_any_host_flag($scfg)`
+      wiring the value through the subsystem-create call and all five
+      Issue-#12 configfs-resync ping sites. Users on TN 25.10.x with
+      a populated allowed_hosts should set `tn_nvme_allow_any_host 0`
+      in storage.cfg to opt into the enforcement posture and fix the
+      reporter's original render-abort bug on that version.
+
+      Default is TRUE (not FALSE, which was tried and reverted during
+      beta3 iteration): on TN 26.0.0-BETA.2 a freshly-created subsystem
+      with allow_any_host=false AND empty allowed_hosts is silently
+      not rendered to the kernel configfs at all -- port has no
+      listener, no host can connect, `nvme discover` shows only the
+      discovery subsystem. Verified live: flipping a fresh
+      allow_any_host=false subsys to true on TN 26.0.0-BETA.2
+      immediately triggers configfs render (generation counter
+      increments, subsys appears in discovery). Since we cannot
+      auto-populate allowed_hosts from the plugin without a bigger
+      rework, defaulting to true keeps NVMe working out-of-the-box
+      on 26.x and lets 25.10.x users opt into the enforcement posture
+      when they have configured allowed_hosts. Auto-population of
+      the host allow-list is deferred to a later release.
+
+    - #98 (lubosmikulec): broker's core.ping liveness check was
+      no_auth_required, so it kept returning success even after
+      TrueNAS silently expired the API-key session at 30 days
+      (AA_LEVEL1.max_session_age hardcoded on TN middleware). Broker
+      would then indefinitely hand out an unauth'd connection whose
+      every real API call fails ENOTAUTHENTICATED; only a
+      broker restart recovered. Switched broker liveness check to
+      `auth.me` (requires auth). Also extended plugin's preflight
+      "API reachable" call from core.ping to auth.me, and extended
+      _is_auth_error() to match ENOTAUTHENTICATED / "Not authenticated".
+
+      auth.me returns a large response (full user + role list) that
+      TN's middleware serialises around user-record locks. Running
+      it on every get_or_open_ws() call as a naive replacement for
+      core.ping tripped 596 PVE-API timeouts under multi-node test
+      load. The broker now caches the last successful liveness probe
+      per pool entry for LIVENESS_CACHE_SECS (60s) and skips the
+      probe when it's still fresh -- healthy connections pay near
+      zero per-call overhead, and the 30-day expiry is still detected
+      within one cache window of the next call. A freshly-opened
+      pool entry is stamped as-of the successful ws_open() +
+      auth.login_with_api_key, so the first burst of calls after a
+      new session doesn't probe redundantly either.
+
+    - #68 (kbogert, root-cause + fix by WarlockSyno): bracketed IPv6
+      literals in tn_api_host (e.g. `[fd00:1::1]`) were rejected by
+      the storage-config parser, because the schema format was
+      `pve-storage-server`, which accepts only bare IPv4/DNS names
+      and refuses colons/brackets. Switched to `pve-storage-portal-dns`
+      (same format PVE core's ISCSIPlugin uses for its portal field),
+      which correctly parses bracketed IPv6. Paired plugin fixes in
+      _ws_open: normalise bare IPv6 to bracketed form for consistent
+      PeerHost/Host-header/SNI handling, and strip brackets before
+      passing to SSL_hostname so SNI + certificate name-verify match
+      the cert's IPv6 SAN. Cherry-picked from PR-branch
+      fix/issue-68-ipv6-api-host after realising it had never been
+      merged to alpha despite the earlier close-invitation.
+
+    - #85 / #84 (JonahMMay): two related template-clone bugs.
+      _find_free_disk_name and list_images' owner-VMID detection only
+      recognized `vm-<vmid>-...` names, so a template disk already
+      renamed to `base-<vmid>-disk-N` by create_base became invisible
+      to both the disk allocator and any VMID-scoped listing. Moving
+      a second disk of the same template to a storage reused the same
+      disk index and create_base's rename crashed with "dataset already
+      exists". Both now match `base-`-prefixed names too. Cloud-init
+      volumes were named vol-<zname>-lun<N>/-ns<uuid> like every other
+      disk, but PVE core's drive_is_cloudinit() only recognizes a
+      volid ending in "cloudinit" with no vol- prefix or metadata
+      suffix. Since ours never matched, core treated cloud-init drives
+      as plain CD-ROMs and copied the reference verbatim on clone
+      instead of regenerating it, so clones silently kept the
+      template's cloud-init config. Cloud-init disks are now named
+      exactly `vm-<vmid>-cloudinit`; since that form can't carry
+      embedded LUN/NVMe-UUID metadata, path() and activate_volume
+      resolve the transport device dynamically by zvol path when
+      metadata is absent. Also carried in this cherry-pick: shared
+      `_resolve_iscsi_lun` / `_resolve_nvme_uuid` helpers used from
+      path() / activate_volume / free_image; free_image best-effort
+      LUN resolve so its pre-teardown SCSI cleanup no longer skips
+      cloud-init deletes; NVMe path()'s device-discovery retry now
+      short-circuits when the re-resolved UUID matches the failed one
+      (avoids a duplicate subsystem reconnect); nvmet.namespace.query
+      now cached in _resolve_nvme_uuid to halve back-to-back
+      activate_volume + path() round trips. Cherry-picked from PR-branch
+      fix/issue-84-85-template-clone-naming after realising it had
+      never been merged to alpha.
+
+    - #91 (klosz007): _iscsi_login_all gave tn_portals entries a
+      guaranteed --login fallback but not tn_discovery_portal, which
+      only got a session if it happened to appear in the node list
+      produced by sendtargets discovery. With distinct portals for
+      the discovery IP and tn_portals (the documented multipath
+      example) only the tn_portals IP connected. The fallback loop
+      now covers $primary the same as @extra. Cherry-picked from
+      PR-branch fix/issue-91-iscsi-primary-portal-login.
+
+  * Broker (tools/truenas-plugin-broker):
+
+    - #98: paired with the plugin change above. get_or_open_ws()
+      pings with auth.me instead of core.ping, so an expired session
+      fails the check and the pool entry is dropped + reopened +
+      re-auth'd on the next call.
+
+  * install.sh:
+
+    - #68 (kbogert, root-cause + fix by WarlockSyno): matching
+      installer-side IPv6 gaps. validate_ip() accepts IPv6 bare or
+      bracketed. validate_host() routes any colon-containing input
+      to validate_ip() instead of the hostname regex. /dev/tcp
+      reachability probes strip brackets before connecting (bash
+      doesn't understand bracket syntax). Manual portal IP:port
+      entry now disambiguates [ipv6]:port, bare IPv6, and
+      ipv4-or-host:port as three separate forms. TrueNAS interface
+      auto-discovery captures IPv6 addresses too (was IPv4-only) and
+      skips ::1/fe80:: link-local. tn_create_portal /
+      tn_create_nvme_port / tn_find_nvme_port strip brackets before
+      sending to TrueNAS APIs (which expect bare addresses).
+
+
+    - #67 (spz-uquidit): plugin function test hardcoded --net0
+      bridge=vmbr0 in three qm create sites, failing outright on
+      hosts without vmbr0 (common on hosts with separate storage
+      and public bridges). New `test_pick_bridge()` helper resolves
+      bridge via env var override (TRUENAS_PLUGIN_TEST_BRIDGE),
+      then vmbr0 if it exists, then first vmbr* found via
+      `ip -o link show type bridge`, falling back to vmbr0 to
+      preserve legacy behaviour. All three test-VM create sites
+      now use the helper.
+
+    - #86 issue 4 (RobD68): normalize_tag_version() regex accepted
+      only vX.Y.Z or vX.Y.Z-debN, so any alpha/beta/rc release tag
+      (v2.1.21-alpha1, v2.1.23-beta2) was rejected with "Release
+      tag format is invalid; expected vX.Y.Z or vX.Y.Z-debN",
+      forcing admins to dpkg -i a manually-downloaded .deb. Broadened
+      the pre-release suffix regex to `(-[A-Za-z0-9._~+-]+)?$`.
+
+    - #86 issue 1 (plappermaul): execute_provisioning() silently
+      accepted an empty PROV_SUBSYSTEM_ID from a
+      `python3 -c "...data.get('id', '')"` one-liner with stderr
+      suppressed, then skipped the NVMe port block (gated on
+      -n PROV_SUBSYSTEM_ID) without incrementing errors, leaving
+      PROVISIONED_PORTAL_IP unset and writing a literal
+      `tn_discovery_portal :` (bare colon) to storage.cfg. Now
+      captures the underlying lookup's exit code and stderr, prints
+      a loud error with remediation guidance, and increments errors
+      so the errors gate on the port block does its job.
+
+  * Packaging (debian/):
+
+    - #60 (lucidnx): postinst unconditionally ran `systemctl
+      try-restart pvedaemon pveproxy pvestatd`, silently disconnecting
+      any active PVE web-UI session (painful for admins reaching
+      the UI through jump hosts or PAM-mediated password vaults).
+      Added TRUENAS_PLUGIN_NO_RESTART=1 env-var escape hatch: when
+      set, postinst skips the PVE-side restart and prints the exact
+      command to run manually. truenas-plugin-broker restart in
+      enable_broker() still runs unconditionally (our own service,
+      does not touch the web UI).
+
+    - #4 (JonahMMay): Ship a new /usr/sbin/truenas-plugin-lvm-filter
+      helper that appends a global_filter reject regex to
+      /etc/lvm/lvm.conf's existing list, addressing the host-side
+      LVM scanning of TN NVMe/TCP namespaces (which triggers
+      duplicate-VG warning storms and can cascade into 596s API
+      timeouts that break Veeam and other pollers). The regex
+      matches `/dev/disk/by-id/nvme-TrueNAS_.*`, populated by udev
+      from the NVMe controller MODEL string; local NVMe drives use
+      other vendor prefixes and are untouched. Not applied at
+      package install (that would silently edit pve-manager's
+      conffile); the sysadmin runs `truenas-plugin-lvm-filter
+      --install` explicitly. Idempotent, with timestamped backup
+      and clean `--uninstall`. Documented in
+      wiki/LVM-Filter.md, cross-linked from Troubleshooting.md.
+
+  * No functional change over #77 and #76's shipping behaviour
+    (both were latent code paths, not user-visible bugs). #90 is
+    the only semi-breaking change and is scoped by the migration
+    notes above. #98 removes the 30-day session-expiry silent
+    failure. #60/#67/#86/#4 are all admin-experience improvements
+    with well-defined defaults.
+
+ -- Bill O'Hanlon <claude_104@ixsystems.com>  Tue, 09 Sep 2026 15:30:00 -0400
 truenas-proxmox-plugin (2.1.23~beta2) unstable; urgency=medium
 
   * install.sh: two fixes to the wizard's TrueNAS API write path,

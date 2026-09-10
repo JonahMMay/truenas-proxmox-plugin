@@ -4,9 +4,9 @@ use strict;
 use warnings;
 
 # Plugin Version
-our $VERSION = '2.1.23~beta2';
+our $VERSION = '2.1.23~beta3';
 # Highest Proxmox storage API version this plugin is validated against.
-our $TESTED_APIVER = 14;
+our $TESTED_APIVER = 15;
 use JSON::PP qw(encode_json decode_json);
 use URI::Escape qw(uri_escape);
 use MIME::Base64 qw(encode_base64);
@@ -436,7 +436,13 @@ sub _dataset_orphan_check_and_delete {
 sub _is_auth_error {
     my ($error) = @_;
     return 0 if !defined $error;
-    return $error =~ /401 Unauthorized|403 Forbidden|authentication.*failed|unauthorized|forbidden|invalid.*key/i;
+    # ENOTAUTHENTICATED / "Not authenticated" surface from TrueNAS 25.10+
+    # after the middleware silently expires an API-key session at 30
+    # days (AA_LEVEL1.max_session_age). Naming them here makes the
+    # classification correct in retry/log paths even though the broker
+    # liveness check (auth.me, issue #98) is the primary place the
+    # condition is detected and handled.
+    return $error =~ /401 Unauthorized|403 Forbidden|authentication.*failed|unauthorized|forbidden|invalid.*key|ENOTAUTHENTICATED|Not authenticated/i;
 }
 
 # ======== Retry logic with exponential backoff ========
@@ -522,7 +528,7 @@ sub _retry_with_backoff {
 
 # ======== Storage plugin identity ========
 # Storage API version - dynamically adapts to PVE version
-# Supports PVE 8.x (APIVER 11) and PVE 9.x (APIVER 14)
+# Supports PVE 8.x (APIVER 11) through PVE 9.2+ (APIVER 15)
 sub api {
     my $tested_apiver = $TESTED_APIVER;  # Latest tested version (PVE 9.x)
 
@@ -557,8 +563,8 @@ sub properties {
     return {
         # Transport & connection
         tn_api_host => {
-            description => "TrueNAS hostname or IP.",
-            type => 'string', format => 'pve-storage-server',
+            description => "TrueNAS hostname or IP (IPv6 literals must be bracketed, e.g. [fd00:1::1]).",
+            type => 'string', format => 'pve-storage-portal-dns',
         },
         tn_api_key => {
             description => "TrueNAS user-linked API key.",
@@ -667,6 +673,25 @@ sub properties {
             description => "DH-HMAC-CHAP controller authentication key for bidirectional auth - optional.",
             type => 'string',
             optional => 1,
+        },
+        tn_nvme_allow_any_host => {
+            description => "Value the plugin writes to the TrueNAS NVMe subsystem's " .
+                          "`allow_any_host` attribute on create and on Issue-#12 " .
+                          "configfs-resync ping updates. Default: TRUE (the plugin " .
+                          "asks TN to accept any host NQN on the subsystem). Set to " .
+                          "0/false ONLY when you have populated allowed_hosts on the " .
+                          "same subsystem via the TrueNAS UI or API and want the " .
+                          "allow-list actually enforced. Two caveats: (a) on TN " .
+                          "26.0.0-BETA.2 (and possibly other 26.x betas), a " .
+                          "freshly-created subsystem with allow_any_host=false AND " .
+                          "empty allowed_hosts is silently not rendered to the " .
+                          "kernel configfs at all -- port has no listener, no host " .
+                          "can connect. Keep true here unless you have populated " .
+                          "the allow-list first. (b) on TN 25.10.x, " .
+                          "attr_allow_any_host=1 combined with a populated " .
+                          "allowed_hosts aborts the configfs render (issue #90); " .
+                          "set this to false in that scenario.",
+            type => 'boolean', optional => 1, default => 1,
         },
 
         # ZFS compression algorithm for new volumes
@@ -800,6 +825,7 @@ sub options {
         tn_hostnqn                => { optional => 1 },
         tn_nvme_dhchap_secret     => { optional => 1 },
         tn_nvme_dhchap_ctrl_secret => { optional => 1 },
+        tn_nvme_allow_any_host     => { optional => 1 },
 
         # ZFS tunables
         tn_compression => { optional => 1 },
@@ -1021,8 +1047,12 @@ sub _ws_defaults($scfg) {
 sub _ws_open($scfg) {
     my ($scheme, $port) = _ws_defaults($scfg);
     my $host = $scfg->{tn_api_host};
+    # Normalize bare IPv6 literals to bracketed form (DNS names/IPv4 never contain ':').
+    # Keeps PeerHost/SNI-strip/Host-header all working from the same unambiguous form.
+    $host = "[$host]" if $host =~ /:/ && $host !~ /^\[/;
     my $peer = ($scfg->{tn_prefer_ipv4} // 1) ? _host_ipv4($host) : $host;
     my $path = '/api/current';
+    (my $sni = $host) =~ s/^\[|\]$//g; # SNI/cert-name matching must not include IPv6 brackets
 
     my $sock;
     if ($scheme eq 'wss') {
@@ -1030,7 +1060,7 @@ sub _ws_open($scfg) {
             PeerHost => $peer,
             PeerPort => $port,
             SSL_verify_mode => $scfg->{tn_api_insecure} ? 0x00 : 0x02,
-            SSL_hostname    => $host,
+            SSL_hostname    => $sni,
             Timeout => 15,
         ) or die "WebSocket secure connection failed (wss://): $SSL_ERROR\n  Ensure TrueNAS 25.10+ is running and WebSocket service is enabled.\n";
     } else {
@@ -1477,9 +1507,16 @@ sub _api_bulk_call($scfg, $method_name, $params_array, $description = undef) {
         die "Bulk operations are disabled in storage configuration";
     }
 
-    # Bulk operations are always write operations, use ephemeral connection
-    return _api_call_mutate($scfg, 'core.bulk', [$method_name, $params_array, $description],
-        sub { die "Bulk operations require WebSocket transport (TrueNAS 25.10+ only)\n"; });
+    # Bulk operations are always write operations, use ephemeral connection.
+    # The trailing sub { die ... } fallback was aspirational -- _api_call_mutate
+    # has an exact 3-arg signature ($scfg, $ws_method, $ws_params) and Perl's
+    # native signature enforcement dies with "Too many arguments for
+    # subroutine ... (got 4; expected 3)" before the call ever reaches TN.
+    # The intended "die if the broker/WS transport is unavailable" behaviour
+    # already happens inside _api_call_mutate's own broker/connection paths,
+    # so the caller-supplied fallback was redundant even if the signature
+    # had accepted it. Issue #77 (WarlockSyno) option 1: drop it.
+    return _api_call_mutate($scfg, 'core.bulk', [$method_name, $params_array, $description]);
 }
 
 # Bulk snapshot deletion helper
@@ -1686,7 +1723,17 @@ sub _wait_for_job_completion {
 
         my $job_status;
         eval {
-            $job_status = _api_call($scfg, 'core.call', ['core.get_jobs', [{ id => int($job_id) }]]);
+            # Issue #76 (WarlockSyno, verified against TN 25.10.2.1): TN does
+            # not export a 'core.call' method. Calling it produces JSON-RPC
+            # code -32601 ("Method does not exist"), so every job-completion
+            # poll returns an eval error and _wait_for_job_completion reports
+            # a false failure even for jobs that actually completed
+            # successfully server-side. Also, the inner params [{ id => ... }]
+            # were the wrong shape for 'core.get_jobs' anyway -- like every
+            # other .query method it takes a filter array. Fix: call
+            # 'core.get_jobs' directly with a real filter.
+            $job_status = _api_call($scfg, 'core.get_jobs',
+                [[ ["id", "=", int($job_id)] ]]);
         };
 
         if ($@) {
@@ -2588,12 +2635,18 @@ sub _find_free_disk_name {
     my $dataset = $scfg->{tn_dataset};
     my $prefix = "vm-$vmid-disk-";
 
-    # Single query: fetch all children of the parent dataset matching our VM's prefix
+    # Single query: fetch all children of the parent dataset matching either
+    # the live (vm-) or templated (base-) disk-name prefix for this VMID.
+    # Templated disks are excluded from consideration here just as much as
+    # live ones do -- otherwise moving a second disk of the same template to
+    # this storage picks an index already used by a previously-moved
+    # (and by-then-renamed-to-base-) disk, and the later create_base rename
+    # collides with it (issue #85).
     # Escape regex special chars in dataset path (TrueNAS uses Python regex)
     (my $dataset_escaped = $dataset) =~ s/([.+*?^()\[\]{}|\\])/\\$1/g;
     my $children = eval {
         _api_call($scfg, 'pool.dataset.query', [
-            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/${prefix}"]]
+            [["pool", "=", (split('/', $dataset))[0]], ["name", "~", "^${dataset_escaped}/(?:vm|base)-${vmid}-disk-"]]
         ]);
     };
     my %existing;
@@ -2603,9 +2656,8 @@ sub _find_free_disk_name {
 
     for (my $n = 0; $n < 1000; $n++) {
         my $candidate = "${prefix}$n";
-        if (!$existing{"$dataset/$candidate"}) {
-            return $candidate;
-        }
+        next if $existing{"$dataset/${prefix}$n"} || $existing{"$dataset/base-$vmid-disk-$n"};
+        return $candidate;
     }
 
     die sprintf(
@@ -2680,6 +2732,18 @@ sub _snapshot_clone_paths {
 sub _is_snapshot_clone_zname {
     my ($zname) = @_;
     return index($zname, SNAPSHOT_CLONE_PREFIX) == 0;
+}
+
+# Cloud-init disks must be named exactly "vm-<vmid>-cloudinit" with no
+# "vol-" prefix and no transport-metadata suffix (-lun<N> / -ns<uuid>) --
+# PVE core's drive_is_cloudinit() pattern-matches the volid and only
+# regenerates cloud-init drives on clone/template if it recognizes this
+# exact form (issue #84). Because the name can't carry embedded metadata,
+# these volumes resolve their transport device dynamically by zvol path
+# at path()/activate_volume time instead of from the volname.
+sub _is_cloudinit_zname {
+    my ($zname) = @_;
+    return $zname =~ /^vm-\d+-cloudinit$/;
 }
 
 # Resolve an iSCSI extent by its disk (zvol) path instead of by name.
@@ -2829,6 +2893,17 @@ sub _current_lun_for_zname($scfg, $zname) {
     return defined($tx) ? $tx->{lunid} : undef;
 }
 
+# Resolve the LUN to use for a volume: the embedded one if the volname
+# carries it, otherwise looked up by zvol path. Cloud-init volumes
+# (issue #84) have no embedded metadata and always take the lookup path.
+sub _resolve_iscsi_lun($scfg, $zname, $known_lun) {
+    return $known_lun if defined $known_lun;
+    my $lun = _current_lun_for_zname($scfg, $zname);
+    die "Could not locate iSCSI LUN for '$zname' (IQN " . ($scfg->{tn_target_iqn} // '') . ")\n"
+        if !defined $lun;
+    return $lun;
+}
+
 # Pre-flight validation checks before volume allocation
 # Returns arrayref of error messages (empty if all checks pass)
 # Results are cached for 30 seconds to avoid redundant checks during multi-disk creation.
@@ -2870,9 +2945,15 @@ sub _preflight_check_alloc {
     my @errors;
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
-    # Check 1: TrueNAS API is reachable
+    # Check 1: TrueNAS API is reachable AND we're actually authenticated.
+    # 'core.ping' would satisfy reachable-ness but is no_auth_required, so
+    # a broker connection whose session has silently expired at 30 days
+    # (issue #98) would falsely report the API as healthy. 'auth.me'
+    # requires auth, so it fails cleanly if the session is gone -- and
+    # the broker's own liveness check on the next call will drop and
+    # re-auth the pool entry.
     eval {
-        _api_call($scfg, 'core.ping', []);
+        _api_call($scfg, 'auth.me', []);
     };
     if ($@) {
         push @errors, "TrueNAS API is unreachable: $@";
@@ -3284,8 +3365,11 @@ sub _iscsi_login_all($scfg) {
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$portal,'--login'],
                  "iscsiadm login failed ($portal)");
     }
-    # attempt direct login for any extra portals not already in -m node
-    for my $p (@extra) {
+    # attempt direct login for any configured portal not already in -m node.
+    # $primary must get the same guaranteed fallback as @extra, otherwise it
+    # silently ends up with no session if sendtargets discovery from it alone
+    # doesn't produce a matching node record (issue #91).
+    for my $p ($primary, @extra) {
         # Skip login if this portal is already connected
         next if _portal_connected($scfg, $p, \@session_lines);
         _try_run(['iscsiadm','-m','node','-T',$iqn,'-p',$p,'--login'],
@@ -3618,6 +3702,33 @@ sub _device_for_lun($scfg, $lun, $max_retries_override = undef) {
 }
 
 # ======== NVMe/TCP Helper Functions ========
+
+# Return the JSON boolean to use for a subsystem's `allow_any_host`
+# attribute per the storage's tn_nvme_allow_any_host setting. Default
+# is FALSE: the plugin no longer forces a subsystem to accept any
+# host, because doing so silently defeats a host-NQN allow-list and
+# actively breaks configfs when an allow-list is populated (issue
+# #90). See _nvme_create_subsystem and the Issue #12 configfs-sync
+# workaround sites for the callers.
+#
+# `attr_allow_any_host = 1` and a populated `allowed_hosts/` are
+# mutually exclusive in the kernel; nvmet's config-writer aborts the
+# whole render on the first symlink into `allowed_hosts/` when
+# `allow_any_host = true`, so port-subsys, port and namespace
+# symlinks never get written and the TCP listener never opens. When
+# a user with an existing allow-list installs the plugin, that alone
+# was enough to take the entire NVMe/TCP target offline silently.
+sub _nvme_allow_any_host_flag($scfg) {
+    # Default TRUE to match TN 26.0.0-BETA.2's create-time render
+    # requirement (a fresh subsys with allow_any_host=false AND empty
+    # allowed_hosts is not rendered to configfs at all). Users on TN
+    # 25.10.x whose allowed_hosts is populated should set
+    # tn_nvme_allow_any_host=0 in storage.cfg to fix the opposite
+    # bug in that version (attr_allow_any_host=1 + populated
+    # allow-list aborts render). See the property description above
+    # for the full trade-off; issue #90.
+    return ($scfg->{tn_nvme_allow_any_host} // 1) ? JSON::PP::true : JSON::PP::false;
+}
 
 # Get or read host NQN from /etc/nvme/hostnqn
 sub _nvme_get_hostnqn {
@@ -4986,11 +5097,16 @@ sub _nvme_ensure_subsystem {
     $name = $1 if $nqn =~ /:([^:]+)$/;
     $name =~ s/[^a-zA-Z0-9_\-]/_/g;
 
-    # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation
+    # TrueNAS 25.10+ no longer accepts serial parameter in subsystem creation.
+    # allow_any_host defaults to true here (TN 26.0.0-BETA.2 won't render
+    # a fresh subsys with false + empty allowed_hosts); users with a
+    # populated allow_hosts on 25.10.x should set
+    # tn_nvme_allow_any_host = 0 in storage.cfg to enforce it. See
+    # _nvme_allow_any_host_flag and issue #90.
     my $subsys = _api_call_mutate($scfg, 'nvmet.subsys.create', [{
         name => $name,
         subnqn => $nqn,
-        allow_any_host => JSON::PP::true,  # TODO: Make configurable for auth
+        allow_any_host => _nvme_allow_any_host_flag($scfg),
     }]);
 
     my $subsys_id = ref($subsys) eq 'HASH' ? $subsys->{id} : $subsys;
@@ -5077,8 +5193,12 @@ sub _nvme_create_namespace {
 
     _log($scfg, 1, 'info', "[TrueNAS] nvme_create_namespace: created namespace with UUID $device_uuid");
 
-    # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-    eval { _api_call_mutate($scfg, 'nvmet.subsys.update', [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+    # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12).
+    # The update() is a benign ping to trigger the configfs re-render; we pass
+    # the currently-configured allow_any_host value so we do not silently flip
+    # a user-set attribute back to true (issue #90).
+    eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
+        [$subsys_id, { allow_any_host => _nvme_allow_any_host_flag($scfg) }]) };
     if ($@) {
         _log($scfg, 1, 'warning', "[TrueNAS] nvme_create_namespace: subsystem reapply failed (non-fatal): $@");
     }
@@ -5362,6 +5482,27 @@ sub _nvme_reap_orphan_namespaces {
     return $reaped;
 }
 
+# Resolve the NVMe device_uuid to use for a volume: the embedded one if the
+# volname carries it, otherwise looked up by zvol path. Cloud-init volumes
+# (issue #84) have no embedded metadata and always take the lookup path.
+# Cached (short TTL, cleared by the normal _clear_cache mutation hooks) so
+# that path() and activate_volume back-to-back for the same cloud-init
+# volume don't each pay a separate nvmet.namespace.query round trip.
+sub _resolve_nvme_uuid($scfg, $zname, $known_uuid) {
+    return $known_uuid if defined $known_uuid;
+    my $device_path = "zvol/" . $scfg->{tn_dataset} . '/' . $zname;
+    my $storage_id = _cache_host_key($scfg);
+    my $cache_method = "ns_by_path:$device_path";
+    my $ns = _get_cached($storage_id, $cache_method);
+    if (!$ns) {
+        $ns = _nvme_namespaces_for_device_path($scfg, $device_path);
+        _set_cache($storage_id, $cache_method, $ns);
+    }
+    my $uuid = @$ns ? $ns->[0]{device_uuid} : undef;
+    die "Could not locate NVMe namespace for '$zname'\n" if !defined $uuid;
+    return $uuid;
+}
+
 # Delete NVMe namespace
 sub _nvme_delete_namespace {
     my ($scfg, $zname, $full_ds) = @_;
@@ -5385,10 +5526,24 @@ sub _nvme_delete_namespace {
 
 # ======== Required storage interface ========
 # volname format:
-#   iSCSI:    vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
-#   NVMe/TCP: vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
+#   iSCSI:      vol-<zname>-lun<N>, where <zname> is usually vm-<vmid>-disk-<n>
+#   NVMe/TCP:   vol-<zname>-ns<uuid>, where uuid is the device_uuid from TrueNAS
+#   Cloud-init: vm-<vmid>-cloudinit, no "vol-" prefix and no metadata suffix --
+#               required verbatim by PVE core's drive_is_cloudinit() (issue #84).
+#               Device is resolved dynamically by zvol path, see
+#               _resolve_iscsi_lun / _resolve_nvme_uuid.
 sub parse_volname {
     my ($class, $volname) = @_;
+
+    # Cloud-init disk: plain "vm-<vmid>-cloudinit", no prefix/suffix. The
+    # classification goes through the same predicate alloc_image/list_images
+    # use, so the two can't drift on what counts as a cloud-init volname;
+    # the digit extraction below is safe because that predicate already
+    # guarantees the ^vm-\d+-cloudinit$ shape.
+    if (_is_cloudinit_zname($volname)) {
+        my ($vmid) = $volname =~ /^vm-(\d+)-cloudinit$/;
+        return ('images', $volname, $vmid, undef, undef, undef, 'raw', undef);
+    }
 
     # Slash-encoded linked-clone form (PVE convention):
     #   <base_volid>/<clone_volid>
@@ -5468,32 +5623,65 @@ sub path {
     }
 
     if ($mode eq 'iscsi') {
-        # iSCSI: metadata is LUN number
+        # iSCSI: metadata is LUN number. Cloud-init volumes (issue #84) carry
+        # no embedded metadata and always take the re-resolve path below.
         my $lun = $metadata;
         _iscsi_login_all($scfg);
         my $dev;
-        eval { $dev = _device_for_lun($scfg, $lun); };
-        if ($@ || !$dev) {
-            # try to re-resolve LUN mapping from TrueNAS
-            my $real_lun = eval { _current_lun_for_zname($scfg, $zname) };
-            if (defined $real_lun && (!defined($lun) || $real_lun != $lun)) {
+        my $lookup_err;
+        if (defined $lun) {
+            eval { $dev = _device_for_lun($scfg, $lun); };
+            $lookup_err = $@;
+        }
+        if (!$dev) {
+            # No embedded LUN, or the embedded one may be stale: re-resolve
+            # the current mapping via the shared helper (also the sole path
+            # for cloud-init volumes, which have no embedded metadata at
+            # all -- issue #84). Dies with a clear message if unresolvable.
+            my $real_lun = _resolve_iscsi_lun($scfg, $zname, undef);
+            if (!defined($lun) || $real_lun != $lun) {
                 $dev = _device_for_lun($scfg, $real_lun);
             } else {
-                die $@ if $@; # bubble up original cause
+                # Mapping is unchanged: the original _device_for_lun failure
+                # already carries a detailed diagnostic (active sessions,
+                # by-path listing) that's more useful than a generic
+                # message, so bubble it up instead of re-deriving one.
+                die $lookup_err if $lookup_err;
                 die "Could not locate device for LUN $lun (IQN $scfg->{tn_target_iqn})\n";
             }
         }
         return ($dev, $vmid, 'images');
 
     } elsif ($mode eq 'nvme-tcp') {
-        # NVMe: metadata is device_uuid
+        # NVMe: metadata is device_uuid. Cloud-init volumes (issue #84) carry
+        # no embedded metadata and always take the re-resolve path below.
         my $uuid = $metadata;
         _nvme_connect($scfg);
         # alpha25: allow_reconnect=1 — same rationale as the snapshot path
         # above. Every PVE op that touches an NVMe volume goes through path();
         # denying reconnect here made every stale-kernel recovery path
         # unreachable and every mismatch a certain failure.
-        my $dev = _nvme_device_for_uuid($scfg, $uuid, allow_reconnect => 1);
+        my $dev;
+        my $lookup_err;
+        if (defined $uuid) {
+            eval { $dev = _nvme_device_for_uuid($scfg, $uuid, allow_reconnect => 1); };
+            $lookup_err = $@;
+        }
+        if (!$dev) {
+            # No embedded UUID, or the embedded one may be stale: re-resolve
+            # the current namespace via the shared helper (also the sole
+            # path for cloud-init volumes -- issue #84).
+            my $real_uuid = _resolve_nvme_uuid($scfg, $zname, undef);
+            if (!defined($uuid) || $real_uuid ne $uuid) {
+                $dev = _nvme_device_for_uuid($scfg, $real_uuid, allow_reconnect => 1);
+            } else {
+                # UUID is unchanged: the original lookup already ran the
+                # full discovery/retry loop, so a second identical attempt
+                # would just repeat it. Bubble up the original diagnostic.
+                die $lookup_err if $lookup_err;
+                die "Could not locate NVMe device for UUID $uuid\n";
+            }
+        }
         return ($dev, $vmid, 'images');
 
     } else {
@@ -5890,7 +6078,9 @@ sub _alloc_image_iscsi {
 
     # 5) Return volname immediately — device discovery is deferred after lock release.
     # activate_volume handles authoritative device discovery before any VM uses the disk.
-    my $volname = "vol-$zname-lun$lun";
+    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
+    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
+    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
 
     # Defer local I/O operations (iSCSI login, rescan, device polling) to run after CFS lock release
     my $deferred_scfg = $scfg;  # capture for closure
@@ -6002,8 +6192,10 @@ sub _alloc_image_nvme {
     }
     _log($scfg, 1, 'info', "[TrueNAS] _alloc_image_nvme: created namespace with UUID $device_uuid");
 
-    # Return volname immediately — defer connect + device discovery
-    my $volname = "vol-$zname-ns$device_uuid";
+    # Return volname immediately — defer connect + device discovery.
+    # Cloud-init disks (issue #84) must be named exactly "vm-<vmid>-cloudinit" with
+    # no metadata suffix, so PVE core recognizes and regenerates them on clone.
+    my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
 
     my $deferred_scfg = $scfg;
     my $deferred_uuid = $device_uuid;
@@ -6023,8 +6215,11 @@ sub _alloc_image_nvme {
         };
         $lap_defer->('entry');
 
-        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12).
+        # Ping via update() with the currently-configured allow_any_host so we
+        # do not silently overwrite a user-set attribute (issue #90).
+        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update',
+            [$deferred_subsys_id, { allow_any_host => _nvme_allow_any_host_flag($deferred_scfg) }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] alloc_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }
@@ -6149,13 +6344,19 @@ sub free_image {
     }
 
     # Level 2: Verbose - parsed details
-    _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=$metadata, full_ds=$full_ds");
+    _log($scfg, 2, 'debug', "[TrueNAS] free_image: zname=$zname, metadata=" . ($metadata // 'none') . ", full_ds=$full_ds");
 
     # Dispatch to transport-specific deletion
     my $mode = $scfg->{tn_transport_mode} // 'iscsi';
 
     if ($mode eq 'iscsi') {
-        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
+        # Cloud-init volumes (issue #84) carry no embedded LUN; resolve one
+        # best-effort so _free_image_iscsi can still pre-clean the local
+        # SCSI device before the TrueNAS-side delete. Failure here must not
+        # block deletion (the zvol/extent lookup below is independent of
+        # LUN), so a failed resolve just leaves $lun undef as before.
+        my $lun = $metadata // eval { _resolve_iscsi_lun($scfg, $zname, undef) };
+        return _free_image_iscsi($class, $storeid, $scfg, $volname, $zname, $full_ds, $lun);
     } elsif ($mode eq 'nvme-tcp') {
         return _free_image_nvme($class, $storeid, $scfg, $volname, $zname, $full_ds, $metadata);
     } else {
@@ -6736,9 +6937,14 @@ sub _list_images_iscsi {
         my $lun = $tx->{lunid};
         next MAPPING if !defined $lun;
 
-        # Owner (vmid) from our naming convention
+        # Owner (vmid) from our naming convention. Must match both live
+        # disks (vm-<vmid>-...) and templated/base disks (base-<vmid>-...) --
+        # otherwise core's find_free_diskname() never sees a template's
+        # existing base-<vmid>-disk-N volumes on this storage and reuses a
+        # colliding index when a second disk of the same template is moved
+        # here (issue #85).
         my $owner;
-        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+        $owner = $1 if $zname =~ /^(?:vm|base)-(\d+)-/;
 
         # Honor $vmid filter
         if (defined $vmid) {
@@ -6746,8 +6952,9 @@ sub _list_images_iscsi {
             next MAPPING if !defined $owner || $owner != $vmid;
         }
 
-        # Compose plugin volname + volid
-        my $volname = "vol-$zname-lun$lun";
+        # Compose plugin volname + volid. Cloud-init disks (issue #84) are
+        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
+        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-lun$lun";
         my $volid   = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -6876,18 +7083,24 @@ sub _list_images_nvme {
         # are not Proxmox-managed volumes and must not appear in list_images.
         next if _is_snapshot_clone_zname($zname);
 
-        # Owner (vmid) from naming convention
+        # Owner (vmid) from naming convention. Must match both live disks
+        # (vm-<vmid>-...) and templated/base disks (base-<vmid>-...) --
+        # otherwise core's find_free_diskname() never sees a template's
+        # existing base-<vmid>-disk-N volumes on this storage and reuses a
+        # colliding index when a second disk of the same template is moved
+        # here (issue #85).
         my $owner;
-        $owner = $1 if $zname =~ /^vm-(\d+)-/;
+        $owner = $1 if $zname =~ /^(?:vm|base)-(\d+)-/;
 
         # Honor $vmid filter
         if (defined $vmid) {
             next if !defined $owner || $owner != $vmid;
         }
 
-        # Compose volname using device_uuid
+        # Compose volname using device_uuid. Cloud-init disks (issue #84) are
+        # named exactly "vm-<vmid>-cloudinit" with no metadata suffix.
         my $device_uuid = $ns->{device_uuid} // next;
-        my $volname = "vol-$zname-ns$device_uuid";
+        my $volname = _is_cloudinit_zname($zname) ? $zname : "vol-$zname-ns$device_uuid";
         my $volid = "$storeid:$volname";
 
         # Honor explicit include filter
@@ -7411,8 +7624,20 @@ sub _clone_snapshot_zvol {
 
     my $clone_result = eval { _tn_dataset_clone($scfg, $source_snapshot, $clone_full) };
     if (my $err = $@) {
-        # Already present from a prior activate — reuse it.
-        return if $err =~ /dataset already exists/i;
+        # Already present from a prior activate — reuse it. The rest of
+        # _expose_snapshot_device is already idempotent (extent/namespace
+        # lookup-before-create), so the caller can proceed against the
+        # leftover clone.
+        #
+        # Match either the newer TN 25.10.x error string
+        # (ZFSPathAlreadyExistsException, "Path already exists on the
+        # pool") or the older "dataset already exists" phrasing. Missing
+        # the ZFSPath variant was issue #59: a single failed vzdump run
+        # left the clone in place, the next backup died at this line
+        # with "already exists", and every subsequent backup failed
+        # forever until an operator manually destroyed the clone and its
+        # parent @vzdump snapshot on TrueNAS.
+        return if $err =~ /ZFSPathAlreadyExistsException|dataset already exists|path already exists/i;
         die "Failed to clone snapshot $source_snapshot to $clone_full: $err\n";
     }
 
@@ -7513,9 +7738,11 @@ sub _expose_snapshot_device {
             die $ns_err if $ns_err;
             my $device_uuid = $ns->{device_uuid}
                 // die "No device_uuid returned from namespace creation\n";
-            # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
+            # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12).
+            # Ping via update() with the currently-configured allow_any_host
+            # (see _nvme_allow_any_host_flag / issue #90).
             eval { _api_call_mutate($scfg, 'nvmet.subsys.update',
-                [$subsys_id, { allow_any_host => JSON::PP::true }]) };
+                [$subsys_id, { allow_any_host => _nvme_allow_any_host_flag($scfg) }]) };
 
             _nvme_connect($scfg);
             eval { _nvme_rescan_subsystem_controllers($scfg) };
@@ -7650,8 +7877,9 @@ sub activate_volume {
             usleep(UDEV_SETTLE_TIMEOUT_US);
         }
 
-        # Wait for the specific LUN device to appear (up to ~20s, configurable)
-        my $lun = $metadata;
+        # Wait for the specific LUN device to appear (up to ~20s, configurable).
+        # Cloud-init volumes (issue #84) carry no embedded LUN; resolve by zname.
+        my $lun = _resolve_iscsi_lun($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for LUN $lun device");
         eval {
             my $dev = _device_for_lun($scfg, $lun);
@@ -7709,8 +7937,11 @@ sub activate_volume {
             my $subs = _api_call($scfg, 'nvmet.subsys.query', [[["subnqn","=",$nqn]]]);
             if ($subs && @$subs) {
                 my $subsys_id = $subs->[0]{id};
+                # Ping subsys.update with the currently-configured
+                # allow_any_host to trigger a configfs re-sync (issue #12)
+                # without overwriting a user-set attribute (issue #90).
                 _api_call_mutate($scfg, 'nvmet.subsys.update',
-                    [$subsys_id, { allow_any_host => JSON::PP::true }]);
+                    [$subsys_id, { allow_any_host => _nvme_allow_any_host_flag($scfg) }]);
                 _log($scfg, 2, 'debug',
                     "[TrueNAS] activate_volume: pre-wait subsys.update sent for subsys $subsys_id");
             }
@@ -7721,8 +7952,9 @@ sub activate_volume {
         }
         $lap_av->('pre_wait_subsys_update');
 
-        # Wait for the specific namespace device to appear (up to 5s)
-        my $device_uuid = $metadata;
+        # Wait for the specific namespace device to appear (up to 5s).
+        # Cloud-init volumes (issue #84) carry no embedded UUID; resolve by zname.
+        my $device_uuid = _resolve_nvme_uuid($scfg, $zname, $metadata);
         _log($scfg, 2, 'debug', "[TrueNAS] activate_volume: waiting for device UUID $device_uuid");
         eval {
             my $dev = _nvme_device_for_uuid($scfg, $device_uuid, allow_reconnect => 1);
@@ -8129,8 +8361,11 @@ sub _clone_image_nvme {
     my $deferred_uuid = $device_uuid;
     my $deferred_subsys_id = $subsys_id;
     _defer_after_lock(sub {
-        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12)
-        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update', [$deferred_subsys_id, { allow_any_host => JSON::PP::true }]) };
+        # Workaround: TrueNAS may not sync configfs after namespace create (Issue #12).
+        # Ping via update() with the currently-configured allow_any_host
+        # (see _nvme_allow_any_host_flag / issue #90).
+        eval { _api_call_mutate($deferred_scfg, 'nvmet.subsys.update',
+            [$deferred_subsys_id, { allow_any_host => _nvme_allow_any_host_flag($deferred_scfg) }]) };
         if ($@) {
             _log($deferred_scfg, 1, 'warning', "[TrueNAS] clone_image_nvme deferred: subsystem reapply failed (non-fatal): $@");
         }

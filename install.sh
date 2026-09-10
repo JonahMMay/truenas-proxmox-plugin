@@ -1085,7 +1085,16 @@ normalize_tag_version() {
 
     tag="${raw_tag#v}"
 
-    if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-deb[0-9]+)?$ ]]; then
+    # Accept any pre-release suffix (`-alphaN`, `-betaN`, `-rcN`,
+    # `-debN`, `-anything`) rather than only `-debN`. Historically this
+    # regex was hardcoded to `-deb[0-9]+`, which rejected all
+    # alpha/beta releases outright with "Release tag format is invalid;
+    # expected vX.Y.Z or vX.Y.Z-debN" and forced admins to fall back to
+    # `dpkg -i` on a manually-downloaded .deb (issue #86 comment by
+    # RobD68; tracked in #93). The suffix's content is not
+    # semantically parsed here, only recognised as valid; the picker
+    # still displays the raw tag name for the user to choose.
+    if [[ "$tag" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9._~+-]+)?$ ]]; then
         echo "${BASH_REMATCH[1]}"
         return 0
     fi
@@ -2917,6 +2926,39 @@ test_api_call() {
     return $exit_code
 }
 
+# Pick a bridge for the plugin-function-test VMs. Historically this
+# script hardcoded `vmbr0` in every `qm create --net0 bridge=`
+# invocation, which fails with `bridge 'vmbr0' does not exist` on
+# hosts that use a different bridge naming scheme (issue #67). Hosts
+# with multiple bridges also often have vmbr0 for public traffic and
+# vmbr1+ for cluster/storage — the test only needs *any* bridge to
+# attach the test VM's NIC to, not vmbr0 specifically.
+#
+# Resolution order:
+#   1. TRUENAS_PLUGIN_TEST_BRIDGE env var, if set (operator override).
+#   2. `vmbr0` if it actually exists (preserve legacy behavior).
+#   3. The first `vmbr*` link found via `ip -o link show type bridge`.
+#   4. Fall back to `vmbr0` and let the error surface as it did before.
+test_pick_bridge() {
+    if [ -n "${TRUENAS_PLUGIN_TEST_BRIDGE:-}" ]; then
+        echo "$TRUENAS_PLUGIN_TEST_BRIDGE"
+        return
+    fi
+    if ip -o link show vmbr0 >/dev/null 2>&1; then
+        echo vmbr0
+        return
+    fi
+    local first
+    first=$(ip -o link show type bridge 2>/dev/null \
+        | awk -F': ' '{print $2}' | awk '{print $1}' \
+        | grep -E '^vmbr[0-9]+$' | head -1)
+    if [ -n "$first" ]; then
+        echo "$first"
+        return
+    fi
+    echo vmbr0
+}
+
 # Function to find available VM IDs dynamically
 test_find_available_vm_ids() {
     local base_id=${1:-990}
@@ -3019,13 +3061,14 @@ test_volume_creation() {
     printf "%-30s " "Create test VM:"
     start_spinner
 
+    local test_bridge=$(test_pick_bridge)
     local output
     output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
         --vmid "$TEST_VM_BASE" \
         --name "test-base-vm" \
         --memory 512 \
         --cores 1 \
-        --net0 "virtio,bridge=vmbr0" \
+        --net0 "virtio,bridge=$test_bridge" \
         --scsihw "virtio-scsi-pci" 2>&1)
 
     if [[ $? -ne 0 ]]; then
@@ -3413,13 +3456,14 @@ test_vm_migration() {
         migrate_vm_id=$((migrate_vm_id + 1))
     done
 
+    local test_bridge=$(test_pick_bridge)
     local output
     output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
         --vmid "$migrate_vm_id" \
         --name "test-migrate-vm" \
         --memory 256 \
         --cores 1 \
-        --net0 "virtio,bridge=vmbr0" 2>&1)
+        --net0 "virtio,bridge=$test_bridge" 2>&1)
 
     if [[ $? -ne 0 ]]; then
         stop_spinner
@@ -3482,13 +3526,14 @@ test_cross_node_clone() {
         clone_source_vm=$((clone_source_vm + 1))
     done
 
+    local test_bridge=$(test_pick_bridge)
     local output
     output=$(test_api_call POST "/nodes/$NODE_NAME/qemu" \
         --vmid "$clone_source_vm" \
         --name "test-clone-source" \
         --memory 256 \
         --cores 1 \
-        --net0 "virtio,bridge=vmbr0" \
+        --net0 "virtio,bridge=$test_bridge" \
         --scsihw "virtio-scsi-pci" 2>&1)
 
     if [[ $? -ne 0 ]]; then
@@ -4747,11 +4792,16 @@ run_health_check() {
         printf "%-30s " "TrueNAS API:"
         start_spinner
         local api_result
-        if timeout 5 bash -c ">/dev/tcp/$api_host/$api_port" 2>/dev/null; then
-            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host:$api_port"
+        # bash's /dev/tcp does not understand bracketed IPv6 ("[::1]"); strip brackets for the probe
+        local api_host_bare="${api_host#\[}"
+        api_host_bare="${api_host_bare%\]}"
+        local api_host_display="$api_host"
+        [[ "$api_host_display" == *:* && "$api_host_display" != \[* ]] && api_host_display="[$api_host_display]"
+        if timeout 5 bash -c ">/dev/tcp/$api_host_bare/$api_port" 2>/dev/null; then
+            api_result="${COLOR_GREEN}✓${COLOR_RESET} Reachable on $api_host_display:$api_port"
             ((checks_passed++))
         else
-            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host:$api_port"
+            api_result="${COLOR_RED}✗${COLOR_RESET} Cannot reach $api_host_display:$api_port"
             ((errors++))
         fi
         stop_spinner
@@ -5529,7 +5579,7 @@ get_all_storage_config_values() {
     awk '{print $1 "=" $2}'
 }
 
-# Validate IP address format
+# Validate IP address format (IPv4 dotted-quad, or IPv6 bare/bracketed literal)
 validate_ip() {
     local ip="$1"
     if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
@@ -5542,6 +5592,13 @@ validate_ip() {
         done
         return 0
     fi
+    # IPv6: strip optional brackets, then validate via Perl's inet_pton (avoids
+    # a hand-rolled regex for zone IDs/compression/embedded-IPv4 edge cases)
+    local ip6="${ip#\[}"
+    ip6="${ip6%\]}"
+    if [[ -n "$ip6" ]] && perl -MSocket -e 'exit(defined(Socket::inet_pton(Socket::AF_INET6(), $ARGV[0])) ? 0 : 1)' "$ip6" 2>/dev/null; then
+        return 0
+    fi
     return 1
 }
 
@@ -5550,6 +5607,13 @@ validate_host() {
     local host="$1"
     # All-numeric dotted strings must be valid IPv4; otherwise reject.
     if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        validate_ip "$host" && return 0
+        return 1
+    fi
+    # A colon means an IPv6 literal (bare or bracketed) - never a valid
+    # hostname label, so validate as an IP rather than falling through
+    # to the hostname regex below (which would reject the colon/brackets).
+    if [[ "$host" == *:* ]]; then
         validate_ip "$host" && return 0
         return 1
     fi
@@ -5848,9 +5912,9 @@ discover_truenas_portals() {
     fi
 
     # Extract IP addresses from interfaces, excluding the primary IP
-    # Parse JSON to find all "address" fields with IPv4 addresses
+    # Parse JSON to find all "address" fields with IPv4 or IPv6 addresses
     local portals
-    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9.]+' | grep -v "^127\." | grep -v -- "^${primary_ip}$" | sort -u)
+    portals=$(echo "$response" | grep -Po '"address":\s*"\K[0-9a-fA-F.:]+' | grep -v "^127\." | grep -v -- "^::1$" | grep -vi -- "^fe80:" | grep -v -- "^${primary_ip}$" | sort -u)
 
     if [[ -z "$portals" ]]; then
         return 1
@@ -6187,6 +6251,11 @@ display_interface_table() {
     local api_host="$3"
     local apikey="$4"
 
+    # TrueNAS reports interface addresses bracket-free; strip brackets from a
+    # bracketed IPv6 api_host so the mgmt-interface match below compares like-for-like.
+    local api_host_bare="${api_host#\[}"
+    api_host_bare="${api_host_bare%\]}"
+
     # Initialize global arrays
     IFACE_NAMES=()
     IFACE_IPS=()
@@ -6227,7 +6296,7 @@ display_interface_table() {
         return ""
     }
 
-    # Helper function to find all IPv4 addresses in a block
+    # Helper function to find all IPv4/IPv6 addresses in a block
     function find_ipv4_addresses(block, ips,    count, pos, remainder, addr, i, c, in_addr) {
         count = 0
         # Look for "address": "X.X.X.X" patterns
@@ -6247,8 +6316,8 @@ display_interface_table() {
                 if (c == "\"") break
                 addr = addr c
             }
-            # Check if it looks like IPv4 (contains only digits and dots)
-            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            # Check if it looks like IPv4 (digits and dots) or IPv6 (hex and colons)
+            if (addr ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (addr ~ /:/ && addr ~ /^[0-9a-fA-F:]+$/)) {
                 count++
                 ips[count] = addr
             }
@@ -6312,13 +6381,13 @@ display_interface_table() {
                     # Extract active_media_subtype from state object
                     current_speed = extract_value(iface_block, "active_media_subtype")
 
-                    # Extract all IPv4 addresses from aliases array
+                    # Extract all IPv4/IPv6 addresses from aliases array
                     delete ip_list
                     ip_count = find_ipv4_addresses(iface_block, ip_list)
                     for (k = 1; k <= ip_count; k++) {
                         ip = ip_list[k]
-                        # Skip localhost
-                        if (ip !~ /^127\./) {
+                        # Skip loopback/link-local (v4 127.x, v6 ::1 and fe80::/10 - unusable for portals)
+                        if (ip !~ /^127\./ && ip != "::1" && ip !~ /^[fF][eE]80:/) {
                             print current_name "|" ip "|" current_link "|" current_speed
                         }
                     }
@@ -6349,7 +6418,7 @@ display_interface_table() {
 
         # Check if this is the management interface
         local is_mgmt=""
-        if [[ "$ipv4" == "$api_host" ]]; then
+        if [[ "$ipv4" == "$api_host_bare" ]]; then
             is_mgmt="mgmt"
         fi
 
@@ -6363,14 +6432,14 @@ display_interface_table() {
     # Fallback: if awk parsing failed, try simple grep extraction
     if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
         local all_ips
-        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=")' | grep -v "^127\." | sort -u)
+        all_ips=$(echo "$interfaces_json" | grep -Po '"address":\s*"\K[0-9a-fA-F.:]+(?=")' | grep -v "^127\." | grep -v -- "^::1$" | grep -vi -- "^fe80:" | sort -u)
         local idx=1
         for ipv4 in $all_ips; do
             IFACE_NAMES+=("if${idx}")
             IFACE_IPS+=("$ipv4")
             IFACE_SPEEDS+=("-")
             IFACE_STATES+=("UP")
-            if [[ "$ipv4" == "$api_host" ]]; then
+            if [[ "$ipv4" == "$api_host_bare" ]]; then
                 IFACE_MGMT+=("mgmt")
             else
                 IFACE_MGMT+=("")
@@ -6380,7 +6449,7 @@ display_interface_table() {
     fi
 
     if [[ ${#IFACE_IPS[@]} -eq 0 ]]; then
-        error "No network interfaces with IPv4 addresses found on TrueNAS"
+        error "No network interfaces with IPv4 or IPv6 addresses found on TrueNAS"
         return 1
     fi
 
@@ -6414,7 +6483,7 @@ display_interface_table() {
     # Display header
     echo
     printf '%b%b%s%b\n' "${c6}" "${c8}" "TrueNAS Network Interfaces" "${c0}"
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
 
     local portal_col
     if [[ "$transport_mode" == "nvme-tcp" ]]; then
@@ -6422,8 +6491,8 @@ display_interface_table() {
     else
         portal_col="Portal"
     fi
-    printf "  %-3s %-14s %-17s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf "  %-3s %-14s %-30s %-8s %-6s %s\n" "#" "Interface" "IP Address" "Speed" "Link" "$portal_col"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
 
     # Display each interface
     for ((i=0; i<${#IFACE_IPS[@]}; i++)); do
@@ -6458,11 +6527,11 @@ display_interface_table() {
             done
         fi
 
-        printf "  %-3s %-14s %-17s %-8s %b%-6s%b %b\n" \
+        printf "  %-3s %-14s %-30s %-8s %b%-6s%b %b\n" \
             "$num" "$name" "$ip" "$speed" "$state_color" "$state" "${c0}" "$portal_status"
     done
 
-    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..65})" "${c0}"
+    printf '%b%s%b\n' "${c6}" "$(printf '─%.0s' {1..78})" "${c0}"
     echo
 
     return 0
@@ -6572,7 +6641,7 @@ select_interfaces() {
     info "Selected interfaces:"
     for idx in "${SELECTED_IFACE_INDICES[@]}"; do
         local arr_idx=$((idx-1))
-        printf "  • %-14s %-17s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
+        printf "  • %-14s %-30s %s\n" "${IFACE_NAMES[$arr_idx]}" "${IFACE_IPS[$arr_idx]}" "${IFACE_SPEEDS[$arr_idx]}"
     done
 
     return 0
@@ -7025,6 +7094,11 @@ tn_create_portal() {
     local api_key="$2"
     local listen_ip="$3"
     local listen_port="${4:-3260}"
+
+    # TrueNAS's iscsi.portal.create 'ip' field wants a bare address; strip
+    # brackets in case an IPv6 literal arrived in [addr] display form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
 
     log "INFO" "Creating iSCSI portal: $listen_ip:$listen_port"
 
@@ -7511,6 +7585,11 @@ tn_find_nvme_port() {
     local listen_ip="$3"
     local listen_port="${4:-4420}"
 
+    # TrueNAS stores addr_traddr as a bare address; strip brackets so the
+    # comparison below matches an IPv6 literal that arrived in [addr] form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
+
     log "INFO" "Searching for existing NVMe port: $listen_ip:$listen_port"
 
     # Query all ports
@@ -7560,6 +7639,11 @@ tn_create_nvme_port() {
     local subsystem_id="$3"
     local listen_ip="$4"
     local listen_port="${5:-4420}"
+
+    # TrueNAS's nvmet.port addr_traddr field wants a bare address; strip
+    # brackets in case an IPv6 literal arrived in [addr] display form.
+    listen_ip="${listen_ip#\[}"
+    listen_ip="${listen_ip%\]}"
 
     log "INFO" "Creating/finding NVMe port for subsystem $subsystem_id: $listen_ip:$listen_port"
 
@@ -8687,10 +8771,33 @@ execute_provisioning() {
         if [[ "$PROV_TARGET_EXISTS" == "true" ]]; then
             echo -e "$(printf "%-30s " "NVMe subsystem:")${c2}✓${c0} Using existing"
             PROVISIONED_SUBSYSTEM_NQN="$PROV_NQN"
-            # Get subsystem ID for port association
+            # Get subsystem ID for port association. Historically the two
+            # 2>/dev/null suppressions on this pair of commands, combined
+            # with `data.get('id', '')` returning an empty string on any
+            # parse or lookup failure, let PROV_SUBSYSTEM_ID come back
+            # empty without raising an error. The "NVMe port" block below
+            # is gated on `[[ -n "$PROV_SUBSYSTEM_ID" ]]`, so it would
+            # silently skip; PROVISIONED_PORTAL_IP and PROVISIONED_PORTAL_PORT
+            # then stay unset and generate_storage_config wrote
+            # `tn_discovery_portal :` (bare colon) to storage.cfg,
+            # silently producing a broken config (issue #86 sub-item 1,
+            # tracked in #93). Surface the failure loudly instead: the
+            # errors gate below prevents the port block from running and
+            # generate_storage_config's `[[ -n "$portal" ]]` guard keeps
+            # the empty portal out of the file.
             local subsys_info
-            subsys_info=$(tn_check_subsystem "$host" "$api_key" "$PROV_NQN" 2>/dev/null)
+            subsys_info=$(tn_check_subsystem "$host" "$api_key" "$PROV_NQN" 2>&1)
+            local subsys_lookup_rc=$?
             PROV_SUBSYSTEM_ID=$(echo "$subsys_info" | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('id', ''))" 2>/dev/null)
+            if [[ $subsys_lookup_rc -ne 0 ]] || [[ -z "$PROV_SUBSYSTEM_ID" ]]; then
+                echo -e "$(printf "%-30s " "NVMe subsystem:")${c1}✗${c0} Could not resolve subsystem ID for '$PROV_NQN'"
+                echo "  $subsys_info" | head -3 | sed 's/^/    /'
+                echo "  Port association will be skipped, and 'tn_discovery_portal'"
+                echo "  cannot be filled in. Verify the subsystem exists on TrueNAS,"
+                echo "  the API key has 'nvmet.subsys.query' access, and the network"
+                echo "  path to the middleware is up. Then re-run the wizard."
+                ((errors++))
+            fi
         else
             printf "%-30s " "NVMe subsystem:"
             start_spinner
@@ -10751,25 +10858,47 @@ menu_configure_storage() {
     while true; do
         read -rp "Portal IP (optional, press Enter to use TrueNAS IP): " portal
         if [[ -z "$portal" ]]; then
-            portal="${truenas_ip}:${default_port}"
+            # Bracket a bare IPv6 truenas_ip before appending :port (plain ":" would be ambiguous)
+            local truenas_ip_disp="$truenas_ip"
+            [[ "$truenas_ip_disp" == *:* && "$truenas_ip_disp" != \[* ]] && truenas_ip_disp="[$truenas_ip_disp]"
+            portal="${truenas_ip_disp}:${default_port}"
             break
         else
-            # Extract IP part (may or may not have port)
-            local portal_ip="${portal%%:*}"
+            # Extract IP part and optional port. IPv6 addresses contain colons
+            # themselves, so a port suffix is only unambiguous in two forms:
+            # "[ipv6]:port" (bracketed) or "ipv4-or-host:port" (single colon).
+            # A bare IPv6 literal (multiple colons, no brackets) can't carry a
+            # port suffix at all - treat the whole string as the address.
+            local portal_ip portal_port
+            if [[ "$portal" =~ ^\[([0-9a-fA-F:]+)\](:([0-9]+))?$ ]]; then
+                portal_ip="[${BASH_REMATCH[1]}]"
+                portal_port="${BASH_REMATCH[3]}"
+            elif [[ "$portal" == *:*:* ]]; then
+                portal_ip="$portal"
+                portal_port=""
+            else
+                portal_ip="${portal%%:*}"
+                if [[ "$portal" == *:* ]]; then
+                    portal_port="${portal##*:}"
+                else
+                    portal_port=""
+                fi
+            fi
+
             if ! validate_ip "$portal_ip"; then
                 error "Invalid IP address format"
                 continue
             fi
-            if [[ ! "$portal" =~ : ]]; then
+            if [[ -z "$portal_port" ]]; then
                 # Add default port if not specified
-                portal="${portal}:${default_port}"
+                portal="${portal_ip}:${default_port}"
             else
                 # Validate port number
-                local portal_port="${portal##*:}"
                 if ! [[ "$portal_port" =~ ^[0-9]+$ ]] || [[ "$portal_port" -lt 1 ]] || [[ "$portal_port" -gt 65535 ]]; then
                     error "Invalid port number (must be 1-65535)"
                     continue
                 fi
+                portal="${portal_ip}:${portal_port}"
             fi
             break
         fi

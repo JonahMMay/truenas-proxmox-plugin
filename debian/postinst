@@ -41,6 +41,21 @@ enable_broker() {
 }
 
 restart_proxmox_services() {
+    # Restarting pvedaemon / pveproxy / pvestatd disconnects the operator
+    # from any active PVE web-UI session, which for people who reach the
+    # UI through a jump host or a PAM-mediated password vault is more
+    # painful than for a local admin (issue #60). Give them an escape
+    # hatch: setting TRUENAS_PLUGIN_NO_RESTART=1 before `dpkg -i` skips
+    # the PVE-side restarts and prints exactly the command to run when
+    # they can afford the disconnect. The truenas-plugin-broker restart
+    # in enable_broker() still runs unconditionally -- that's our own
+    # service and does not touch the web UI session.
+    if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
+        echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting Proxmox services."
+        echo "  When convenient, run manually to pick up the new plugin:"
+        echo "    systemctl restart pvedaemon pveproxy pvestatd"
+        return 0
+    fi
     if have_systemd; then
         systemctl try-restart pvedaemon pveproxy pvestatd || true
     elif command -v invoke-rc.d >/dev/null 2>&1; then

@@ -44,6 +44,22 @@ my $LOG_FILE       = '/var/log/truenas-plugin-broker.log';
 my $IDLE_REAP_SECS = 600;   # close WS conns idle longer than this
 my $WS_PATH = '/api/current';
 
+# Cache the pool-entry liveness probe (`auth.me`) result for up to
+# this many seconds. Every plugin call goes through get_or_open_ws();
+# running an auth-required RPC on every call adds a per-call round
+# trip whose per-call cost is small in isolation but compounds under
+# multi-node load, and 'auth.me' in particular returns a large
+# response (full user + role list, several KiB) that TN's middleware
+# serialises around user-record locks -- enough to trip 596 API
+# timeouts in PVE under a busy 3-node test suite. Caching the last
+# successful probe timestamp per pool entry and skipping the probe
+# when it is <LIVENESS_CACHE_SECS old costs essentially nothing on
+# healthy connections and still detects TrueNAS's 30-day silent
+# session expiry (AA_LEVEL1.max_session_age, issue #98) within one
+# cache window. Round-trip cost drops from "every call" to "at most
+# one per LIVENESS_CACHE_SECS per pool entry".
+my $LIVENESS_CACHE_SECS = 60;
+
 # Prefork worker count. Each worker holds one upstream WS (auth'd once) and
 # accepts on the shared listen fd; the kernel load-balances accept() across
 # them. Under 3-node cluster test load a single-threaded broker serialized
@@ -294,22 +310,43 @@ sub get_or_open_ws {
     my $sk = scfg_key($scfg);
     my $entry = $POOL{$sk};
     if ($entry && $entry->{conn} && $entry->{conn}->{sock}) {
-        # Quick liveness check: ping
+        # Liveness check: call an AUTHENTICATED method to detect
+        # TrueNAS's silent 30-day session expiry (AA_LEVEL1.max_session_age;
+        # 'core.ping' is no_auth_required and can't). 'auth.me' fits the
+        # semantic but its response is large and TN serialises around
+        # user-record locks; running it on every call caused 596 PVE-API
+        # timeouts under multi-node load. Cache the last successful probe
+        # per pool entry and skip the probe if it's still fresh -- a
+        # 30-day expiry is still detected within LIVENESS_CACHE_SECS of
+        # the next call, and the round-trip cost drops to near-zero on
+        # healthy connections. See issue #98 for the full write-up.
+        my $now = time();
+        my $last_ok = $entry->{last_liveness_ok} // 0;
+        if ($now - $last_ok < $LIVENESS_CACHE_SECS) {
+            $entry->{last_used} = $now;
+            return $entry->{conn};
+        }
         my $ok = eval {
             ws_rpc($entry->{conn}, {
-                jsonrpc => "2.0", id => 999999, method => "core.ping", params => [],
+                jsonrpc => "2.0", id => 999999, method => "auth.me", params => [],
             });
         };
         if ($ok) {
-            $entry->{last_used} = time();
+            $entry->{last_used} = $now;
+            $entry->{last_liveness_ok} = $now;
             return $entry->{conn};
         }
-        # Dead; drop and reopen
+        # Dead or unauthenticated; drop and reopen (which re-auths).
         eval { $entry->{conn}->{sock}->close(); };
         delete $POOL{$sk};
     }
     my $conn = ws_open($scfg);
-    $POOL{$sk} = { conn => $conn, last_used => time() };
+    my $now = time();
+    # ws_open() ran auth.login_with_api_key against TN successfully to
+    # get here, so the session is definitionally authenticated as of
+    # `now`. Stamp last_liveness_ok so the first N calls (within
+    # LIVENESS_CACHE_SECS) skip the auth.me probe entirely.
+    $POOL{$sk} = { conn => $conn, last_used => $now, last_liveness_ok => $now };
     linfo("opened WS for $sk (pool size " . scalar(keys %POOL) . ")");
     return $conn;
 }
