@@ -1,5 +1,11 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.23~beta4 (September 11, 2026)
+
+### Bug Fixes
+
+- **Restart pve-ha-crm and pve-ha-lrm on install/upgrade (#100)**: Proxmox's storage-plugin autoloader only scans `/usr/share/perl5/PVE/Storage/Custom/*.pm` once, at the moment a process first loads `PVE::Storage`. `pve-ha-crm` and `pve-ha-lrm` start at boot regardless of whether HA is in use, so on a node where they were already running before this package was installed, HA-manager never learned the `truenasplugin` storage type existed until those two daemons restarted — surfacing as "storage provided by plugin is unsupported" for HA resources. `debian/postinst` now restarts `pve-ha-crm`/`pve-ha-lrm` alongside `pvedaemon`/`pveproxy`/`pvestatd`, still gated by the `TRUENAS_PLUGIN_NO_RESTART` opt-out. Verified live that a plain service restart does not freeze, migrate, or fence any HA-tracked resource, since Proxmox's HA stack only takes those actions on a real node shutdown/reboot, not an individual service bounce.
+
 ## Version 2.1.23 (August 5, 2026)
 
 ### Bug Fixes
