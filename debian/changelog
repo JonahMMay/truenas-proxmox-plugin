@@ -1,3 +1,35 @@
+truenas-proxmox-plugin (2.1.23~beta4) unstable; urgency=medium
+
+  * Packaging (debian/postinst): restart pve-ha-crm and pve-ha-lrm on
+    install/upgrade (#100).
+
+    PVE::Storage.pm globs /usr/share/perl5/PVE/Storage/Custom/*.pm and
+    registers each plugin class exactly once, at the moment a process
+    first loads PVE::Storage. pve-ha-crm and pve-ha-lrm auto-start at
+    boot whether or not HA is in use, so on a node where they were
+    already running before this package was installed, HA-manager
+    never learns the truenasplugin type exists until those two
+    daemons restart -- surfacing as "storage provided by plugin is
+    unsupported" in HA resource config, exactly the workaround the
+    community found independently in the issue thread (restart
+    pve-ha-crm/pve-ha-lrm).
+
+    Verified live on a 3-node test cluster that a plain service
+    restart does not disrupt HA-tracked resources: PVE::HA::LRM's
+    shutdown_request() only queues stop/freeze/migrate actions when
+    PVE::HA::Env::PVE2::is_node_shutdown() reports a pending
+    shutdown.target/reboot.target job, which a `systemctl restart`
+    never queues. Ran the modified restart_proxmox_services() against
+    the live pve-ha-crm/pve-ha-lrm on a node carrying two HA-tracked
+    VMs (disarmed/ignore mode): both daemons restarted with fresh
+    PIDs, ha-manager status showed the same services on the same
+    nodes before and after, no migration, freeze, or fencing action
+    triggered. Also verified TRUENAS_PLUGIN_NO_RESTART=1 still skips
+    all four daemons (now including the two HA ones) and prints the
+    updated manual restart command.
+
+ -- TrueNAS Proxmox Plugin Maintainers <noreply@github.com>  Fri, 11 Sep 2026 22:00:00 -0400
+
 truenas-proxmox-plugin (2.1.23~beta3) unstable; urgency=medium
 
   * Bundle of fixes across the plugin runtime, the broker, install.sh,

@@ -53,14 +53,16 @@ restart_proxmox_services() {
     if [ "${TRUENAS_PLUGIN_NO_RESTART:-0}" = "1" ]; then
         echo "TRUENAS_PLUGIN_NO_RESTART=1 is set; not restarting Proxmox services."
         echo "  When convenient, run manually to pick up the new plugin:"
-        echo "    systemctl restart pvedaemon pveproxy pvestatd"
+        echo "    systemctl restart pvedaemon pveproxy pvestatd pve-ha-crm pve-ha-lrm"
         return 0
     fi
     if have_systemd; then
-        systemctl try-restart pvedaemon pveproxy pvestatd || true
+        systemctl try-restart pvedaemon pveproxy pvestatd pve-ha-crm pve-ha-lrm || true
     elif command -v invoke-rc.d >/dev/null 2>&1; then
         invoke-rc.d pvedaemon restart || true
         invoke-rc.d pveproxy restart || true
+        invoke-rc.d pve-ha-crm restart || true
+        invoke-rc.d pve-ha-lrm restart || true
     fi
 }
 
