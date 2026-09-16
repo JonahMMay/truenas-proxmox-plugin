@@ -7222,11 +7222,24 @@ sub _list_images_nvme {
     }
     my $subsys_id = $subsystems->[0]{id};
 
-    # Get all namespaces for this subsystem
-    # Note: Query without filter because TrueNAS API filter syntax is inconsistent
+    # Get the namespaces for this subsystem. Filter on subsys.id, not subsys:
+    # TrueNAS 25.10+ returns `subsys` as a nested object, so the un-dotted
+    # [["subsys","=",id]] form silently matches nothing.
     my $namespaces = eval {
-        _api_call($scfg, 'nvmet.namespace.query', [[]]);
+        _api_call($scfg, 'nvmet.namespace.query', [
+            [["subsys.id", "=", $subsys_id]]
+        ]);
     } // [];
+
+    # An empty result here is ambiguous: it means either "this subsystem has no
+    # namespaces" or "the filter did not match the way we expect". Reporting the
+    # former when it is the latter hides every volume from PVE, so pay for one
+    # unfiltered query before concluding the storage is empty.
+    if (!@$namespaces) {
+        $namespaces = eval {
+            _api_call($scfg, 'nvmet.namespace.query', [[]]);
+        } // [];
+    }
 
     # Filter to only our subsystem ('subsys' may be a scalar id or nested object)
     $namespaces = [ grep {
