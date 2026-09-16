@@ -1,0 +1,181 @@
+#!/bin/bash
+# truenas-plugin-lvm-filter -- add or remove an LVM global_filter
+# entry that prevents LVM from scanning TrueNAS-served NVMe/TCP
+# namespaces on the Proxmox host. Addresses GitHub issue #4.
+#
+# WHY:
+#   A guest VM whose disk lives on a TN NVMe namespace often has its
+#   own LVM inside (Ubuntu, RHEL and their derivatives default to
+#   LVM). The host's LVM scanner sees the guest's PV signatures at
+#   the outer namespace level and treats them as host-level PVs.
+#   With many namespaces and many VMs cloned from the same template,
+#   this produces duplicate-VG warnings on every LVM invocation
+#   (pvesm, pvesh, qm, pvestatd polls), and can slow storage-list
+#   API calls past the 596s API timeout -- which in turn breaks
+#   external tools such as Veeam's backup/restore scans.
+#
+#   The fix is to teach LVM's global_filter to reject the block
+#   devices that come from TrueNAS. We match by /dev/disk/by-id/
+#   symlinks whose name starts with `nvme-TrueNAS_`. Those symlinks
+#   are populated by udev from the NVMe controller MODEL string
+#   (e.g. `TrueNAS PowerEdge R730xd`, `TrueNAS FREENAS-MINI-2.0`)
+#   -- local NVMe drives never match, so LOCAL LVM is unaffected.
+#
+# WHAT THIS SCRIPT DOES:
+#   --install    Append the reject regex to the existing global_filter
+#                list in /etc/lvm/lvm.conf. Timestamped backup first.
+#                Idempotent (no-op if our regex is already present).
+#   --uninstall  Remove only the regex we added; leave the rest of
+#                the global_filter alone. Timestamped backup first.
+#   --status     Report whether our filter is currently installed.
+#   --help       Show this help.
+#
+# WHY THIS ISN'T DONE AT PACKAGE INSTALL:
+#   /etc/lvm/lvm.conf is a conffile owned by the `pve-manager`
+#   package. Debian policy discourages one package silently editing
+#   another package's conffile, and doing so at postinst time would
+#   surprise operators who did not consent to a system-wide LVM
+#   config change. This script exists so the sysadmin can opt in
+#   (or out) explicitly, with a clear audit trail (backup file per
+#   invocation) and a clean reversal path.
+#
+# The right long-term home for this fix is pve-manager itself, in
+# the same default global_filter that already excludes ZFS zvols
+# and Ceph rbds. Filing an upstream patch is queued as separate
+# follow-up work.
+
+set -eu
+
+LVM_CONF=/etc/lvm/lvm.conf
+# Marker used to identify our-inserted regex on uninstall. The regex
+# itself is already unique enough that a plain string match on it is
+# safe, but keeping a stable marker gives operators grepping the
+# file a clear "yes, this is from us" signal.
+OUR_REGEX='"r|/dev/disk/by-id/nvme-TrueNAS_.*|"'
+MARKER_TAG='truenas-proxmox-plugin issue #4'
+
+usage() { sed -n '2,45p' "$0"; }
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "must be run as root" >&2; exit 1
+    fi
+}
+
+require_lvm_conf() {
+    [ -f "$LVM_CONF" ] || { echo "$LVM_CONF not found -- is LVM installed?" >&2; exit 2; }
+}
+
+is_installed() {
+    grep -F "$OUR_REGEX" "$LVM_CONF" >/dev/null 2>&1 \
+        && grep -F "$MARKER_TAG"  "$LVM_CONF" >/dev/null 2>&1
+}
+
+show_status() {
+    echo "-- $LVM_CONF --"
+    if grep -nE "^\s*global_filter\s*=" "$LVM_CONF" >/dev/null 2>&1; then
+        grep -nE "^\s*global_filter\s*=" "$LVM_CONF"
+    else
+        echo "  (no global_filter set)"
+    fi
+    echo
+    if is_installed; then
+        echo "TrueNAS NVMe filter: INSTALLED"
+    else
+        echo "TrueNAS NVMe filter: NOT installed"
+    fi
+}
+
+backup() {
+    local b="$LVM_CONF.bak.$(date +%Y%m%d%H%M%S).truenas-plugin"
+    cp -a "$LVM_CONF" "$b"
+    echo "backup: $b"
+}
+
+do_install() {
+    if is_installed; then
+        echo "TrueNAS NVMe filter is already installed. Nothing to do."
+        show_status
+        return 0
+    fi
+    if ! grep -qE "^\s*global_filter\s*=" "$LVM_CONF"; then
+        echo "No global_filter line in $LVM_CONF. Cowardly refusing to add one" >&2
+        echo "because that could override defaults set by pve-manager." >&2
+        echo "Add manually inside the devices { ... } section:" >&2
+        echo "    global_filter = [ $OUR_REGEX ]   # $MARKER_TAG" >&2
+        exit 3
+    fi
+
+    backup
+    # Insert our regex before the closing "]" of the array on the
+    # global_filter line. Handle both "[a,b,c]" and "[ a, b, c ]"
+    # spacings. Add a same-line comment carrying the marker tag.
+    # Pass regex + marker as perl -s vars so double-quotes inside
+    # the regex don't have to be shell-escaped into a perl literal.
+    perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(\s*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/\s+$//;
+            $body .= "," unless $body =~ /,\s*$/ || $body =~ /^\s*$/;
+            $_ = "${lead}${body} ${r} ${close} # ${m}\n";
+        }
+    ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$LVM_CONF"
+
+    # Sanity-check the file still parses (lvm dumps config on stdout;
+    # exits non-zero on parse error).
+    if ! lvm dumpconfig --file /dev/null >/dev/null 2>&1; then
+        echo "WARNING: lvm.conf appears to no longer parse. Restore backup:" >&2
+        echo "  cp $LVM_CONF.bak.*.truenas-plugin $LVM_CONF" >&2
+        exit 4
+    fi
+
+    echo "Installed. Refresh LVM's device cache with:"
+    echo "  pvscan --cache"
+    echo "  vgscan"
+    show_status
+}
+
+do_uninstall() {
+    if ! is_installed; then
+        echo "TrueNAS NVMe filter is not installed. Nothing to do."
+        return 0
+    fi
+    backup
+    # Remove our regex (plus any preceding comma or whitespace) and
+    # the tail comment marker. Keep the rest of the list intact.
+    # Pass regex + marker via perl -s so double-quotes need no
+    # shell-escape and \Q...\E works over $r without interpolation
+    # of the literal string as a pattern.
+    perl -i -spe '
+        if (/^(\s*global_filter\s*=\s*\[)(.*)(\])(.*)$/) {
+            my ($lead, $body, $close, $tail) = ($1, $2, $3, $4);
+            $body =~ s/,\s*\Q$r\E\s*//g;
+            $body =~ s/\Q$r\E\s*,\s*//g;
+            $body =~ s/\Q$r\E\s*//g;
+            # normalise stray inner whitespace/comma left after removal
+            $body =~ s/^\s+//; $body =~ s/\s+$//;
+            $body =~ s/,\s*,/,/g;
+            $tail =~ s/\s*#\s*\Q$m\E\s*$//;
+            $_ = "${lead}${body}${close}${tail}\n";
+        }
+    ' -- -r="$OUR_REGEX" -m="$MARKER_TAG" "$LVM_CONF"
+
+    if ! lvm dumpconfig --file /dev/null >/dev/null 2>&1; then
+        echo "WARNING: lvm.conf appears to no longer parse. Restore backup:" >&2
+        echo "  cp $LVM_CONF.bak.*.truenas-plugin $LVM_CONF" >&2
+        exit 4
+    fi
+
+    echo "Removed. Refresh LVM's device cache with:"
+    echo "  pvscan --cache"
+    echo "  vgscan"
+    show_status
+}
+
+case "${1:-}" in
+    --install)   require_root; require_lvm_conf; do_install ;;
+    --uninstall) require_root; require_lvm_conf; do_uninstall ;;
+    --status)                  require_lvm_conf; show_status ;;
+    -h|--help)   usage ;;
+    *)           usage; exit 1 ;;
+esac

@@ -1,5 +1,31 @@
 # TrueNAS Plugin Changelog
 
+## Version 2.1.23~beta4 (September 11, 2026)
+
+### Bug Fixes
+
+- **Restart pve-ha-crm and pve-ha-lrm on install/upgrade (#100)**: Proxmox's storage-plugin autoloader only scans `/usr/share/perl5/PVE/Storage/Custom/*.pm` once, at the moment a process first loads `PVE::Storage`. `pve-ha-crm` and `pve-ha-lrm` start at boot regardless of whether HA is in use, so on a node where they were already running before this package was installed, HA-manager never learned the `truenasplugin` storage type existed until those two daemons restarted — surfacing as "storage provided by plugin is unsupported" for HA resources. `debian/postinst` now restarts `pve-ha-crm`/`pve-ha-lrm` alongside `pvedaemon`/`pveproxy`/`pvestatd`, still gated by the `TRUENAS_PLUGIN_NO_RESTART` opt-out. Verified live that a plain service restart does not freeze, migrate, or fence any HA-tracked resource, since Proxmox's HA stack only takes those actions on a real node shutdown/reboot, not an individual service bounce.
+
+## Version 2.1.23 (August 5, 2026)
+
+### Bug Fixes
+
+- **Fix iSCSI discovery portal never establishing a session in multipath configs (#91)**: `_iscsi_login_all` gave every `tn_portals` entry a guaranteed fallback `--login` attempt, but `tn_discovery_portal` only got logged in if it happened to appear in the node list produced by sendtargets discovery. When discovery from the primary portal didn't yield a matching node record, the discovery portal silently ended up with no active session while the additional portals connected normally — reproduced live on the test cluster: with `tn_discovery_portal` and `tn_portals` set to distinct IPs (the documented multipath example), only the `tn_portals` IP connected. The fallback login loop now covers `$primary` the same as `@extra`, so both portals get the same guaranteed retry.
+
+## Version 2.1.22 (July 21, 2026)
+
+### Bug Fixes
+
+- **Fix `pool.dataset.create` crash on TrueNAS 25.10.4 (#58, #65, #78)**: Both dataset-create call sites (`_tn_dataset_create` and `alloc_image`'s inline payload) omitted six optional fields — `volblocksize` (when `tn_zvol_blocksize` was unset), `snapdev`, `reservation`, `refreservation`, `special_small_block_size`, `force_size`. TrueNAS 25.10.4's legacy API compatibility shim leaves omitted optional fields as unresolved `_NotRequired` sentinel objects instead of real defaults, which crashes `pool.dataset.create` — either during validation, or, even when validation passes, during audit-log JSON serialization afterward. The latter case is especially disruptive: it masks a create that actually succeeded server-side, leaving an orphaned zvol on TrueNAS while Proxmox reports total failure. All six fields are now sent explicitly at both call sites. `special_small_block_size` must be `'INHERIT'` specifically — `0` fails a ZFS-level check ("does not apply to datasets of this type"), `null` fails the Pydantic schema check, and `INHERIT` satisfies both, consistent with how every other inheritable property in the payload is already handled.
+- **Fix tainted `volsize`/size values causing full clone and move-disk to fail under Perl taint mode** (#71): `_normalize_value`, the common helper used to pull byte-count fields (`volsize`, `volblocksize`, `available`, `quota`, `written`, `used`) out of TrueNAS API responses, passed the decoded JSON scalar straight through without untainting it. Every value decoded from a WebSocket/broker socket read is tainted under Perl's `-T` mode, which `pveproxy`/`pvedaemon` run under. When PVE core called `volume_size_info` during a full clone or move-disk to a non-TrueNAS storage (NFS, dir, LVM, etc.) and interpolated the tainted size into the `qemu-img create` argv, the operation died with `Insecure dependency in exec while running with -T switch`. `_normalize_value` now untaints the value via regex capture (matching the pattern already used elsewhere in the plugin for NVMe device/portal names) and dies loudly if a value is ever non-numeric, instead of silently forwarding a tainted or malformed scalar.
+
+## Version 2.1.21~alpha1 (July 20, 2026)
+
+### Bug Fixes
+
+- **Make `truenas-plugin-broker` mandatory** (fixes rate-limit cascade seen in `test_run4/truenas-2026-07-{13..15}`): Direct-WS fallback re-authenticated in every forked PVE process and reliably tripped the TrueNAS middlewared login rate limiter, cascading into pre-flight failures across snapshot, resize, clone, additional-disk, and backup paths. `_ws_get_persistent` now refuses to open a direct WS when `/run/truenas-plugin/broker.sock` is absent, dying with a message that points at the .deb install and the `truenas-plugin-broker.service` unit. Escape hatch: `TRUENAS_PLUGIN_ALLOW_DIRECT_WS=1` in the environment for dev use. `postinst` now waits up to 5s for the broker socket after starting the service and prints a diagnostic if it never appears — the previous silent fallback let bad copies (`cp TrueNASPlugin.pm` without `dpkg -i`) look healthy until the first heavy test load.
+- **Preserve real error message in `alloc_image` and `clone_image` failure paths** (6 sites in create-extent / target-extent-mapping / namespace-create for both iSCSI and NVMe-oF): The cleanup `eval` that follows a failed create call clobbered `$@` before the outer `die`, so operators saw "Failed to create iSCSI extent for clone: " with an empty tail (see `test_run4/truenas-2026-07-13/run-01` template/linked-clone failures). Capture the create error into a lexical before the cleanup so the `die` carries the underlying diagnostic (e.g. the duplicate-extent-name or `EBUSY` that actually caused the failure).
+
 ## Version 2.1.20 (July 4, 2026)
 
 ### Bug Fixes

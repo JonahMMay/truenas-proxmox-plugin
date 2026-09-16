@@ -295,6 +295,7 @@ Comprehensive documentation is available in the [Wiki](wiki/):
 - **[Troubleshooting Guide](wiki/Troubleshooting.md)** - Common issues and solutions
 - **[Advanced Features](wiki/Advanced-Features.md)** - Performance tuning, clustering, security
 - **[API Reference](wiki/API-Reference.md)** - Technical details on TrueNAS API integration
+- **[Minimum API Permissions](wiki/API-Permissions.md)** - Least-privilege TrueNAS role set for the API user
 - **[NVMe Setup Guide](wiki/NVMe-Setup.md)** - NVMe/TCP transport setup and authentication
 - **[Multi-Tenancy](wiki/Multi-Tenancy.md)** - Sharing TrueNAS across multiple Proxmox clusters
 - **[Testing Guide](wiki/Testing.md)** - Automated test suite for plugin validation
@@ -325,6 +326,6 @@ This project is provided as-is for use with Proxmox VE and TrueNAS SCALE.
 
 ---
 
-**Version**: 2.1.20
-**Last Updated**: June 16, 2026
+**Version**: 2.1.23
+**Last Updated**: August 5, 2026
 **Compatibility**: Proxmox VE 8.x+, TrueNAS SCALE 25.10+
