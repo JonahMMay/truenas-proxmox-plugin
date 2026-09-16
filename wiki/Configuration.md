@@ -37,6 +37,8 @@ Complete reference for all TrueNAS Proxmox VE Storage Plugin configuration param
   - [tn_nvme_dhchap_ctrl_secret](#tn_nvme_dhchap_ctrl_secret)
   - [tn_nvme_allow_any_host](#tn_nvme_allow_any_host)
   - [tn_nr_io_queues](#tn_nr_io_queues)
+  - [tn_ctrl_loss_tmo](#tn_ctrl_loss_tmo)
+  - [tn_reconnect_delay](#tn_reconnect_delay)
 - [iSCSI Behavior](#iscsi-behavior)
   - [tn_force_delete_on_inuse](#tn_force_delete_on_inuse)
   - [tn_logout_on_free](#tn_logout_on_free)
@@ -546,6 +548,40 @@ When unset, the plugin auto-detects a queue count: the online CPU count when all
 
 ```ini
 tn_nr_io_queues 8
+```
+
+### `tn_ctrl_loss_tmo`
+**Description**: Seconds to keep retrying a lost NVMe/TCP controller before giving up
+**Type**: Integer
+**Valid Range**: -1 to 86400 (`-1` = retry forever)
+**Default**: None (kernel default, 600)
+
+When a controller is lost, the kernel retries until `ctrl_loss_tmo` expires and then tears
+down the controller and its namespaces. In a guest that surfaces as disks vanishing:
+aborted journals, `Buffer I/O error`, and a root filesystem hitting `errors=remount-ro`.
+The 600s default is shorter than many appliance reboots, so a routine TrueNAS reboot for
+patching can cross it. Set `-1` so I/O blocks for the duration of the outage and resumes
+when the target returns.
+
+This only governs the Proxmox host's connection. A guest whose SCSI timeout is shorter than
+the outage still errors first — raise `/sys/block/sd*/device/timeout` in the guest as well
+(30s is the kernel default and is far shorter than any reboot).
+
+```ini
+tn_ctrl_loss_tmo -1
+```
+
+### `tn_reconnect_delay`
+**Description**: Seconds between NVMe/TCP reconnect attempts after a controller is lost
+**Type**: Integer
+**Valid Range**: 1-3600
+**Default**: None (kernel default, 10)
+
+Lower values reconnect sooner after a brief blip at the cost of more connect attempts
+against a target that is still down.
+
+```ini
+tn_reconnect_delay 10
 ```
 
 ## iSCSI Behavior

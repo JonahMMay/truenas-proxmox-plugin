@@ -195,6 +195,8 @@ truenasplugin: truenas-nvme
 | `tn_nvme_dhchap_ctrl_secret` | No | Controller authentication secret (bidirectional; whitelist mode) | None |
 | `tn_nvme_allow_any_host` | No | `1` = open access (any host). `0` = whitelist mode: the plugin registers each node's host NQN + DH-CHAP keys and sets `allow_any_host=false`. | `1` |
 | `tn_nr_io_queues` | No | Pin NVMe/TCP I/O queue count per controller (1–256). Auto-detected when unset: uses online CPU count normally, or `floor(possible/2)` when any CPU is offline. Set manually if TrueNAS reports queue limit errors. | Auto-detected |
+| `tn_ctrl_loss_tmo` | No | Seconds to retry a lost controller before tearing down its namespaces. `-1` retries forever so I/O blocks and resumes across a target reboot instead of erroring. The 600s kernel default is shorter than many appliance reboots. | Kernel default (600) |
+| `tn_reconnect_delay` | No | Seconds between reconnect attempts after a controller is lost. | Kernel default (10) |
 
 **Important Notes:**
 - TrueNAS 25.10+ is required for NVMe-oF operations

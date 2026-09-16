@@ -543,6 +543,22 @@ sub properties {
                           "see issue #48). Set manually if TrueNAS reports queue limit errors.",
             type => 'integer', optional => 1, minimum => 1, maximum => 256,
         },
+        tn_ctrl_loss_tmo => {
+            description => "Seconds the kernel keeps retrying a lost NVMe/TCP controller " .
+                          "before giving up and tearing down its namespaces. -1 retries " .
+                          "forever, so I/O blocks instead of erroring while the target is " .
+                          "down and resumes when it returns (survives a TrueNAS reboot for " .
+                          "patching). When unset the kernel default of 600s applies, which " .
+                          "is shorter than a typical appliance reboot. Guests also need a " .
+                          "SCSI timeout longer than the outage or they will remount read-only " .
+                          "first, regardless of this setting.",
+            type => 'integer', optional => 1, minimum => -1, maximum => 86400,
+        },
+        tn_reconnect_delay => {
+            description => "Seconds between NVMe/TCP reconnect attempts after a controller " .
+                          "is lost. When unset the kernel default of 10s applies.",
+            type => 'integer', optional => 1, minimum => 1, maximum => 3600,
+        },
     };
 }
 sub options {
@@ -619,6 +635,10 @@ sub options {
 
         # NVMe/TCP queue tuning
         tn_nr_io_queues => { optional => 1 },
+
+        # NVMe/TCP connection resilience
+        tn_ctrl_loss_tmo   => { optional => 1 },
+        tn_reconnect_delay => { optional => 1 },
     };
 }
 
@@ -3453,6 +3473,18 @@ sub _nvme_connect {
                 : $nr_online;
         }
         push @cmd, '--nr-io-queues', $nr_io_queues if $nr_io_queues && $nr_io_queues > 0;
+
+        # Connection resilience. Without these the kernel gives up on a lost
+        # controller after ctrl_loss_tmo (default 600s) and tears down its
+        # namespaces, which surfaces in guests as vanished disks and aborted
+        # journals. A target reboot for patching commonly exceeds 600s, so
+        # tn_ctrl_loss_tmo => -1 (retry forever) makes I/O block and then resume
+        # rather than error. Guests still need a SCSI timeout longer than the
+        # outage, or they remount read-only before this ever comes into play.
+        push @cmd, '--ctrl-loss-tmo', $scfg->{tn_ctrl_loss_tmo}
+            if defined $scfg->{tn_ctrl_loss_tmo};
+        push @cmd, '--reconnect-delay', $scfg->{tn_reconnect_delay}
+            if defined $scfg->{tn_reconnect_delay};
 
         # Add host NQN if not default
         push @cmd, '--hostnqn', $hostnqn if $hostnqn;
