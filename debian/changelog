@@ -1,3 +1,35 @@
+truenas-proxmox-plugin (2.1.23~beta4+jm1) unstable; urgency=medium
+
+  * NVMe/TCP: new optional tn_ctrl_loss_tmo and tn_reconnect_delay storage.cfg
+    keys, passed through to nvme connect. Without them the host inherits the
+    kernel default ctrl_loss_tmo; once it expires the kernel tears down the
+    controller and its namespaces, which guests see as disks vanishing
+    mid-write - aborted journals, Buffer I/O errors, and a root filesystem
+    tripping errors=remount-ro, needing a reboot and fsck rather than
+    recovering on its own. An appliance reboot for patching can outlast that
+    window: the outage that prompted this took the target away for ~11.5
+    minutes. Set tn_ctrl_loss_tmo -1 to retry forever so I/O blocks for the
+    duration and resumes when the target returns. Both keys are optional and
+    nothing is passed when unset, so default behaviour is unchanged. Note this
+    governs only the Proxmox host's connection - a guest whose SCSI timeout is
+    shorter than the outage still errors first, so /sys/block/sd*/device/timeout
+    needs raising there too.
+  * NVMe/TCP: _list_images_nvme now filters namespaces server-side on subsys.id
+    instead of fetching every namespace on the appliance and discarding other
+    subsystems' client-side. The old comment blamed inconsistent TrueNAS filter
+    syntax, which referred to the un-dotted [["subsys","=",id]] form that
+    silently matches nothing on TN 25.10+ where subsys is a nested object; the
+    dotted form works. A fallback to one unfiltered query is kept for the empty
+    case, because an empty result is ambiguous between "no namespaces" and "the
+    filter did not match as expected", and reporting the latter as the former
+    would hide every volume from PVE.
+
+  This build also carries this fork's earlier NVMe-oF host-whitelist/DH-CHAP
+  support and cloud-init taint fixes (see 2.1.22~alpha1 below) on top of
+  upstream 2.1.23~beta4.
+
+ -- JonahMMay <jonah@mayfamily.me>  Wed, 16 Sep 2026 16:59:33 +0000
+
 truenas-proxmox-plugin (2.1.23~beta4) unstable; urgency=medium
 
   * Packaging (debian/postinst): restart pve-ha-crm and pve-ha-lrm on
